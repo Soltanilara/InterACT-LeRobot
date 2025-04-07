@@ -44,6 +44,7 @@ python lerobot/scripts/train.py \
 ```
 
 Default config can be found in `lerobot/configs/policy/interact.yaml`
+Wandb is used for logging. Check [https://wandb.ai/](https://wandb.ai/) for more information.
 
 ## Model Architecture
 
