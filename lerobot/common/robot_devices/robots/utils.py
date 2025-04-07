@@ -1,0 +1,16 @@
+from typing import Protocol
+
+
+def get_arm_id(name, arm_type):
+    """Returns the string identifier of a robot arm. For instance, for a bimanual manipulator
+    like Aloha, it could be left_follower, right_follower, left_leader, or right_leader.
+    """
+    return f"{name}_{arm_type}"
+
+
+class Robot(Protocol):
+    def init_teleop(self): ...
+    def run_calibration(self): ...
+    def teleop_step(self, record_data=False): ...
+    def capture_observation(self): ...
+    def send_action(self, action): ...
