@@ -2,6 +2,8 @@
 
 Official implementation of "InterACT: Inter-dependency Aware Action Chunking with Hierarchical Attention Transformers for Bimanual Manipulation" (CoRL 2024).
 
+> If you are using the previous codebase, please use this repository instead
+
 ## Overview
 
 INTERACT is a vision-based bimanual imitation learning approach that uses hierarchical attention mechanisms to capture inter-dependencies between dual-arm joint states and visual inputs. The model features a Hierarchical Attention Encoder and a Multi-arm Decoder, enabling accurate control for complex bimanual manipulation tasks.
@@ -17,6 +19,13 @@ conda create -n interact python=3.10 -y
 conda activate interact
 ```
 
+Clone the repo
+```bash
+git clone https://github.com/Soltanilara/InterACT-LeRobot.git
+cd InterACT-LeRobot
+```
+
+Install LeRobot
 ```bash
 pip install -e .
 pip install -e ".[aloha]"
