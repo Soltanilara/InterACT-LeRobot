@@ -217,14 +217,14 @@ class InterACT(nn.Module):
 
         if self.use_robot_state:
             num_cls_tokens_arm = config.num_cls_tokens_arm
-            self.cls_input_arm1 = nn.Embedding(1, config.dim_model).to(device='cuda:0')
-            self.cls_input_arm2 = nn.Embedding(1, config.dim_model).to(device='cuda:0')
+            self.cls_input_arm1 = nn.Embedding(1, config.dim_model)
+            self.cls_input_arm2 = nn.Embedding(1, config.dim_model)
             if self.use_av_arm:
-                self.cls_input_av = nn.Embedding(1, config.dim_model).to(device='cuda:0')
-        
+                self.cls_input_av = nn.Embedding(1, config.dim_model)
+
         if self.use_images:
             num_cls_tokens_image = config.num_cls_tokens_image
-            self.cls_input_image = nn.Embedding(1, config.dim_model).to(device='cuda:0')
+            self.cls_input_image = nn.Embedding(1, config.dim_model)
 
         if self.use_robot_state:
             num_arm_input_token_encoder = num_cls_tokens_arm + 7
@@ -283,7 +283,7 @@ class InterACT(nn.Module):
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = InterACTEncoder(config)
-        self.decoder = ACTDecoder(config)
+        self.decoder = MultiArmDecoder(config)
 
         self.encoder_robot_state_input_proj = nn.Linear(1, 512)
 
@@ -309,7 +309,16 @@ class InterACT(nn.Module):
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
         self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
 
-        # Final action regression head on the output of the transformer's decoder.
+        # Final action regression heads for each arm
+        # Check if action space is split (e.g., 7 DOF per arm = 14 total)
+        if config.output_shapes["action"][0] == 14:  # Assuming 7 DOF per arm
+            self.action_head_arm1 = nn.Linear(config.dim_model, 7)
+            self.action_head_arm2 = nn.Linear(config.dim_model, 7)
+        else:
+            # For other action spaces, use projection approach
+            self.feature_projection = nn.Linear(2 * config.dim_model, config.dim_model)
+
+        # Keep combined action_head for compatibility
         self.action_head = nn.Linear(config.dim_model, config.output_shapes["action"][0])
 
         self._reset_parameters()
@@ -319,6 +328,17 @@ class InterACT(nn.Module):
         for p in chain(self.encoder.parameters(), self.decoder.parameters()):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
+
+        # Initialize new action heads if they exist
+        if hasattr(self, 'action_head_arm1'):
+            nn.init.xavier_uniform_(self.action_head_arm1.weight)
+            nn.init.zeros_(self.action_head_arm1.bias)
+        if hasattr(self, 'action_head_arm2'):
+            nn.init.xavier_uniform_(self.action_head_arm2.weight)
+            nn.init.zeros_(self.action_head_arm2.bias)
+        if hasattr(self, 'feature_projection'):
+            nn.init.xavier_uniform_(self.feature_projection.weight)
+            nn.init.zeros_(self.feature_projection.bias)
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
@@ -423,45 +443,90 @@ class InterACT(nn.Module):
         # Forward pass through the transformer modules.
         encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed, pos_embed_cls=encoder_in_cls_pos_embed)
 
-        # Prepare the decoder input.
-        encoder_out_arm1 = encoder_out[:self.num_cls_tokens_arm + 7]
-        encoder_in_pos_embed_arm1 = encoder_in_pos_embed[:self.num_cls_tokens_arm + 7]
-        encoder_out_arm2 = encoder_out[self.num_cls_tokens_arm + 7:2*self.num_cls_tokens_arm + 14]
-        encoder_in_pos_embed_arm2 = encoder_in_pos_embed[self.num_cls_tokens_arm + 7:2*self.num_cls_tokens_arm + 14]
+        # Prepare the decoder input with asymmetric encoder contexts.
+        # Extract segments from encoder output
+        encoder_out_arm1_full = encoder_out[:self.num_cls_tokens_arm + 7]
+        encoder_in_pos_embed_arm1_full = encoder_in_pos_embed[:self.num_cls_tokens_arm + 7]
+        encoder_out_arm1_cls = encoder_out[:self.num_cls_tokens_arm]
+        encoder_in_pos_embed_arm1_cls = encoder_in_pos_embed[:self.num_cls_tokens_arm]
+
+        # More clear and correct indexing for arm2
+        arm2_start_idx = self.num_cls_tokens_arm + 7
+        encoder_out_arm2_full = encoder_out[arm2_start_idx:arm2_start_idx + self.num_cls_tokens_arm + 7]
+        encoder_in_pos_embed_arm2_full = encoder_in_pos_embed[arm2_start_idx:arm2_start_idx + self.num_cls_tokens_arm + 7]
+        encoder_out_arm2_cls = encoder_out[arm2_start_idx:arm2_start_idx + self.num_cls_tokens_arm]
+        encoder_in_pos_embed_arm2_cls = encoder_in_pos_embed[arm2_start_idx:arm2_start_idx + self.num_cls_tokens_arm]
+
         if self.use_av_arm:
-            encoder_out_av = encoder_out[2*self.num_cls_tokens_arm + 14:3*self.num_cls_tokens_arm + 21]
-            encoder_in_pos_embed_av = encoder_in_pos_embed[2*self.num_cls_tokens_arm + 14:3*self.num_cls_tokens_arm + 21]
             encoder_out_image = encoder_out[3*self.num_cls_tokens_arm + 21:]
             encoder_in_pos_embed_image = encoder_in_pos_embed[3*self.num_cls_tokens_arm + 21:]
-
-            encoder_out_real = torch.cat([encoder_out_arm1[:self.num_cls_tokens_arm], encoder_out_arm2[:self.num_cls_tokens_arm], encoder_out_av[:self.num_cls_tokens_arm], encoder_out_image[self.num_cls_tokens_image:]], dim=0)
-            encoder_in_pos_embed_real = torch.cat([encoder_in_pos_embed_arm1[:self.num_cls_tokens_arm], encoder_in_pos_embed_arm2[:self.num_cls_tokens_arm], encoder_in_pos_embed_av[:self.num_cls_tokens_arm], encoder_in_pos_embed_image[self.num_cls_tokens_image:]], dim=0)
         else:
             encoder_out_image = encoder_out[2*self.num_cls_tokens_arm + 14:]
             encoder_in_pos_embed_image = encoder_in_pos_embed[2*self.num_cls_tokens_arm + 14:]
 
-            encoder_out_real = torch.cat([encoder_out_arm1[:self.num_cls_tokens_arm], encoder_out_arm2[:self.num_cls_tokens_arm], encoder_out_image[self.num_cls_tokens_image:]], dim=0)
-            encoder_in_pos_embed_real = torch.cat([encoder_in_pos_embed_arm1[:self.num_cls_tokens_arm], encoder_in_pos_embed_arm2[:self.num_cls_tokens_arm], encoder_in_pos_embed_image[self.num_cls_tokens_image:]], dim=0)
+        # Prepare asymmetric encoder contexts for each arm decoder
+        # Arm1 decoder gets: arm1_full + arm2_cls + image features
+        arm1_encoder_context = torch.cat([
+            encoder_out_arm1_full,      # Full arm1 segment (CLS tokens + joint states)
+            encoder_out_arm2_cls,       # Only CLS tokens from arm2
+            encoder_out_image           # Image features
+        ], dim=0)
 
-        # encoder_out_real = torch.cat([encoder_out[:self.num_cls_tokens_arm], encoder_out[self.num_cls_tokens_arm+7:2*self.num_cls_tokens_arm+7], encoder_out[2*self.num_cls_tokens_arm+self.num_cls_tokens_image+14:]], dim=0)
-        # encoder_in_pos_embed_real = torch.cat([encoder_in_pos_embed[:self.num_cls_tokens_arm], encoder_in_pos_embed[self.num_cls_tokens_arm+7:2*self.num_cls_tokens_arm+7], encoder_in_pos_embed[2*self.num_cls_tokens_arm+self.num_cls_tokens_image+14:]], dim=0)
-        # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
+        arm1_encoder_pos = torch.cat([
+            encoder_in_pos_embed_arm1_full,
+            encoder_in_pos_embed_arm2_cls,
+            encoder_in_pos_embed_image
+        ], dim=0)
+
+        # Arm2 decoder gets: arm1_cls + arm2_full + image features
+        arm2_encoder_context = torch.cat([
+            encoder_out_arm1_cls,       # Only CLS tokens from arm1
+            encoder_out_arm2_full,      # Full arm2 segment (CLS tokens + joint states)
+            encoder_out_image           # Image features
+        ], dim=0)
+
+        arm2_encoder_pos = torch.cat([
+            encoder_in_pos_embed_arm1_cls,
+            encoder_in_pos_embed_arm2_full,
+            encoder_in_pos_embed_image
+        ], dim=0)
+
+        # Initialize decoder input
         decoder_in = torch.zeros(
             (self.config.chunk_size, batch_size, self.config.dim_model),
             dtype=encoder_in_pos_embed.dtype,
             device=encoder_in_pos_embed.device,
         )
-        decoder_out = self.decoder(
+
+        # Forward through Multi-arm Decoder
+        arm1_output, arm2_output = self.decoder(
             decoder_in,
-            encoder_out_real,
-            encoder_pos_embed=encoder_in_pos_embed_real,
-            decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
+            arm1_encoder_context,
+            arm2_encoder_context,
+            arm1_encoder_pos,
+            arm2_encoder_pos,
+            self.decoder_pos_embed.weight.unsqueeze(1),
         )
 
-        # Move back to (B, S, C).
-        decoder_out = decoder_out.transpose(0, 1)
+        # Transpose outputs to (B, S, C) for each arm
+        arm1_output = arm1_output.transpose(0, 1)  # (B, chunk_size, dim_model)
+        arm2_output = arm2_output.transpose(0, 1)  # (B, chunk_size, dim_model)
 
-        actions = self.action_head(decoder_out)
+        # Generate actions for each arm separately
+        if hasattr(self, 'action_head_arm1') and hasattr(self, 'action_head_arm2'):
+            arm1_actions = self.action_head_arm1(arm1_output)  # (B, chunk_size, 7)
+            arm2_actions = self.action_head_arm2(arm2_output)  # (B, chunk_size, 7)
+            actions = torch.cat([arm1_actions, arm2_actions], dim=-1)  # (B, chunk_size, 14)
+        else:
+            # Alternative: Use a single action head with concatenated features
+            combined_features = torch.cat([arm1_output, arm2_output], dim=-1)  # (B, chunk_size, 2*dim_model)
+            if hasattr(self, 'feature_projection'):
+                projected = self.feature_projection(combined_features)
+                actions = self.action_head(projected)
+            else:
+                # Fallback: average the features (not ideal but maintains compatibility)
+                decoder_out = (arm1_output + arm2_output) / 2
+                actions = self.action_head(decoder_out)
 
         return actions
 
@@ -620,6 +685,136 @@ class ACTDecoder(nn.Module):
         if self.norm is not None:
             x = self.norm(x)
         return x
+
+
+class MultiArmDecoder(nn.Module):
+    """
+    Multi-arm Decoder with separate paths for each arm and synchronization blocks.
+    Implements Algorithm 2 from the InterACT paper.
+    """
+    def __init__(self, config: InterACTConfig):
+        super().__init__()
+
+        # Separate decoder paths for each arm
+        # Pre-synchronization layers
+        self.arm1_pre_decoder = nn.ModuleList([
+            ACTDecoderLayer(config) for _ in range(config.n_pre_decoder_layers)
+        ])
+        self.arm2_pre_decoder = nn.ModuleList([
+            ACTDecoderLayer(config) for _ in range(config.n_pre_decoder_layers)
+        ])
+
+        # Synchronization block (multi-head self-attention for information sharing)
+        self.sync_block = nn.ModuleList([
+            nn.MultiheadAttention(
+                config.dim_model,
+                config.n_heads,
+                dropout=config.dropout,
+                batch_first=False
+            ) for _ in range(config.n_sync_decoder_layers)
+        ])
+
+        # Post-synchronization layers
+        self.arm1_post_decoder = nn.ModuleList([
+            ACTDecoderLayer(config) for _ in range(config.n_post_decoder_layers)
+        ])
+        self.arm2_post_decoder = nn.ModuleList([
+            ACTDecoderLayer(config) for _ in range(config.n_post_decoder_layers)
+        ])
+
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(config.dim_model)
+        self.norm2 = nn.LayerNorm(config.dim_model)
+
+        self.num_cls_tokens_arm = config.num_cls_tokens_arm
+        self.num_cls_tokens_image = config.num_cls_tokens_image
+
+    def forward(
+        self,
+        decoder_input: Tensor,
+        arm1_encoder_context: Tensor,
+        arm2_encoder_context: Tensor,
+        arm1_encoder_pos: Tensor,
+        arm2_encoder_pos: Tensor,
+        decoder_pos_embed: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Args:
+            decoder_input: (chunk_size, batch_size, dim_model) - initialized decoder queries
+            arm1_encoder_context: Encoder context for arm1 decoder (arm1_full + arm2_cls + images)
+            arm2_encoder_context: Encoder context for arm2 decoder (arm1_cls + arm2_full + images)
+            arm1_encoder_pos: Positional embeddings for arm1 encoder context
+            arm2_encoder_pos: Positional embeddings for arm2 encoder context
+            decoder_pos_embed: Positional embedding for decoder
+
+        Returns:
+            Tuple of (arm1_output, arm2_output), each of shape (chunk_size, batch_size, dim_model)
+        """
+
+        # Initialize separate decoder states for each arm
+        arm1_output = decoder_input.clone()
+        arm2_output = decoder_input.clone()
+
+        # Phase 1: Pre-synchronization decoding
+        # Each arm processes its context independently
+        for layer in self.arm1_pre_decoder:
+            arm1_output = layer(
+                arm1_output,
+                arm1_encoder_context,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=arm1_encoder_pos
+            )
+
+        for layer in self.arm2_pre_decoder:
+            arm2_output = layer(
+                arm2_output,
+                arm2_encoder_context,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=arm2_encoder_pos
+            )
+
+        # Phase 2: Synchronization Block
+        # Concatenate outputs from both arms for information sharing
+        concatenated = torch.cat([arm1_output, arm2_output], dim=0)
+
+        # Apply self-attention across both arms' representations
+        for sync_layer in self.sync_block:
+            concatenated_with_pos = concatenated + torch.cat([decoder_pos_embed, decoder_pos_embed], dim=0)
+            synchronized, _ = sync_layer(
+                concatenated_with_pos,
+                concatenated_with_pos,
+                concatenated
+            )
+            concatenated = concatenated + synchronized  # Residual connection
+
+        # Split back into separate arm representations
+        chunk_size = arm1_output.shape[0]
+        arm1_output = concatenated[:chunk_size]
+        arm2_output = concatenated[chunk_size:]
+
+        # Phase 3: Post-synchronization decoding
+        # Continue processing with shared information
+        for layer in self.arm1_post_decoder:
+            arm1_output = layer(
+                arm1_output,
+                arm1_encoder_context,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=arm1_encoder_pos
+            )
+
+        for layer in self.arm2_post_decoder:
+            arm2_output = layer(
+                arm2_output,
+                arm2_encoder_context,
+                decoder_pos_embed=decoder_pos_embed,
+                encoder_pos_embed=arm2_encoder_pos
+            )
+
+        # Apply final layer normalization
+        arm1_output = self.norm1(arm1_output)
+        arm2_output = self.norm2(arm2_output)
+
+        return arm1_output, arm2_output
 
 
 class ACTDecoderLayer(nn.Module):
